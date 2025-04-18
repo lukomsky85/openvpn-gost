@@ -18,12 +18,11 @@ VPN_SERVICE_NAME="openvpn-server@server-gost"
 # Установка пакетов
 install_packages() {
   apt update
-  apt install -y openvpn easy-rsa openssl git ufw
+  apt install -y openvpn easy-rsa openssl git ufw netcat
   # Собираем gost-engine
   build_gost_engine
 }
 
-# Сборка gost-engine
 build_gost_engine() {
   echo "Скачивание и сборка gost-engine..."
   mkdir -p /usr/local/src/gost-engine
@@ -48,7 +47,6 @@ EOF
   echo "gost-engine собран и настроен."
 }
 
-# Настройка easy-rsa
 setup_easyrsa() {
   if [ ! -d "$EASY_RSA_DIR" ]; then
     echo "Настройка easy-rsa..."
@@ -59,7 +57,6 @@ setup_easyrsa() {
   ./easyrsa init-pki
 }
 
-# Генерация сертификатов и ключей
 generate_certificates() {
   cd "$EASY_RSA_DIR"
   ./easyrsa build-ca nopass
@@ -67,12 +64,10 @@ generate_certificates() {
   ./easyrsa sign-req server server
   ./easyrsa gen-dh
   openvpn --genkey --secret "$EASY_RSA_DIR/pki/ta.key"
-  # Копирование сертификатов и ключей
   mkdir -p "$KEYS_DIR"
   cp pki/ca.crt pki/issued/server.crt pki/private/server.key pki/dh.pem pki/ta.key "$KEYS_DIR"
 }
 
-# Создание системного юнита для openvpn
 create_systemd_service() {
   cat > /etc/systemd/system/$VPN_SERVICE_NAME <<EOF
 [Unit]
@@ -94,7 +89,6 @@ EOF
   systemctl enable $VPN_SERVICE_NAME
 }
 
-# Основная установка OpenVPN с GOST
 install_openvpn() {
   # Запрос параметров
   read -p "Введите порт для OpenVPN (по умолчанию 1194): " PORT
@@ -116,16 +110,11 @@ install_openvpn() {
     *) DNS="158.160.1.1" ;;
   esac
 
-  # Установка и сборка gost-engine
   install_packages
-
-  # Настройка easy-rsa
   setup_easyrsa
-
-  # Генерация сертификатов
   generate_certificates
 
-  # Настройка конфигурации сервера
+  # Настройка конфигурации
   mkdir -p "$CONFIG_DIR"
   cat > "$CONFIG_DIR/server-gost.conf" <<EOF
 port $PORT
@@ -158,30 +147,25 @@ EOF
   echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
   sysctl -p
 
-  # Настройка firewall
+  # Firewall
   ufw allow "$PORT/$PROTO"
   ufw allow OpenSSH
   ufw --force enable
 
-  # Создание systemd сервиса
+  # Сервис
   create_systemd_service
-
-  # Запуск сервиса
   systemctl start $VPN_SERVICE_NAME
   systemctl enable $VPN_SERVICE_NAME
 
-  echo "OpenVPN установлен и запущен на порту $PORT ($PROTO)."
-  echo "Теперь можно создавать клиентов."
+  echo "OpenVPN запущен на порту $PORT ($PROTO)."
 }
 
-# Создание клиента
 create_client() {
   local USERNAME="$1"
   cd "$EASY_RSA_DIR"
   ./easyrsa gen-req "$USERNAME" nopass
   ./easyrsa sign-req client "$USERNAME"
 
-  # Создание файла конфигурации клиента
   mkdir -p "$KEYS_DIR/issued"
   cat > "$KEYS_DIR/issued/${USERNAME}.ovpn" <<EOF
 client
@@ -200,8 +184,7 @@ verb 3
 $(cat "$KEYS_DIR/ca.crt")
 </ca>
 <cert>
-$(sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "$KEYS_DIR/issued/$USER
-NAME.crt")
+$(sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "$KEYS_DIR/issued/$USERNAME.crt")
 </cert>
 <key>
 $(cat "$KEYS_DIR/private/$USERNAME.key")
@@ -211,8 +194,17 @@ $(cat "$KEYS_DIR/ta.key")
 </tls-auth>
 key-direction 1
 EOF
+  echo "Клиентский конфиг: $KEYS_DIR/issued/${USERNAME}.ovpn"
+}
 
-  echo "Клиентский файл создан: $KEYS_DIR/issued/${USERNAME}.ovpn"
+# Новая функция: вывод статистики подключений
+show_connections() {
+  if [ -S "$MANAGEMENT_SOCKET" ] || [ -f "$MANAGEMENT_SOCKET" ]; then
+    echo "Подключенные клиенты:"
+    echo "status 3" | nc -U "$MANAGEMENT_SOCKET" | grep "^CLIENT_LIST" || echo "Нет подключений или socket не активен."
+  else
+    echo "Сокет управления не найден или неактивен: $MANAGEMENT_SOCKET"
+  fi
 }
 
 # Главное меню
@@ -220,48 +212,40 @@ main_menu() {
   while true; do
     clear
     echo "==== Управление OpenVPN с ГОСТ ===="
-    echo "1) Установить и настроить OpenVPN с ГОСТ"
+    echo "1) Установить и настроить OpenVPN"
     echo "2) Создать нового клиента"
-    echo "3) Статистика подключений"
+    echo "3) Показать активные подключения"
     echo "4) Отключить клиента (заготовка)"
     echo "5) Заблокировать клиента (заготовка)"
     echo "6) Управление сервисом"
     echo "7) Выйти"
-    read -p "Ваш выбор: " CHOICE
+    read -p "Выбор: " CHOICE
     case "$CHOICE" in
       1) install_openvpn ;;
-      2) read -p "Введите имя клиента: " CLIENT_NAME; create_client "$CLIENT_NAME" ;;
-      3) 
-        echo "Статистика не реализована в этом скрипте." 
-        read -p "Нажмите Enter" 
-        ;;
-      4) 
-        echo "Отключение клиента — ручная настройка." 
-        read -p "Нажмите Enter" 
-        ;;
-      5) 
-        echo "Блокировка клиента — ручная." 
-        read -p "Нажмите Enter" 
-        ;;
-      6) 
-        echo "1) Старт сервиса" 
-        echo "2) Стоп сервиса" 
-        echo "3) Перезапуск сервиса" 
-        echo "4) Статус" 
+      2) read -p "Имя клиента: " CNAME; create_client "$CNAME" ;;
+      3) show_connections ;;
+      4) echo "Отключение клиента — ручная."
+         read -p "Нажмите Enter" ;;
+      5) echo "Блокировка клиента — вручную."
+         read -p "Нажмите Enter" ;;
+      6)
+        echo "1) Запустить сервис"
+        echo "2) Остановить сервис"
+        echo "3) Перезапустить сервис"
+        echo "4) Статус"
         read -p "Выбор: " SCHOICE
         case "$SCHOICE" in
-          1) systemctl start $VPN_SERVICE_NAME ;;
-          2) systemctl stop $VPN_SERVICE_NAME ;;
-          3) systemctl restart $VPN_SERVICE_NAME ;;
-          4) systemctl status $VPN_SERVICE_NAME ;;
+          1) systemctl start "$VPN_SERVICE_NAME" ;;
+          2) systemctl stop "$VPN_SERVICE_NAME" ;;
+          3) systemctl restart "$VPN_SERVICE_NAME" ;;
+          4) systemctl status "$VPN_SERVICE_NAME" ;;
           *) echo "Неверный выбор." ; read -p "Нажмите Enter" ;;
-        esac
-        ;;
-      7) echo "Выход." ; exit 0 ;;
+        esac ;;
+      7) echo "Выход."; exit 0 ;;
       *) echo "Неверный выбор." ; read -p "Нажмите Enter" ;;
     esac
   done
 }
 
-# Запуск
+# Запуск меню
 main_menu
