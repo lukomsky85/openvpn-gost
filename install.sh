@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# Скрипт установки OpenVPN с российской криптографией (GOST)
-# Включает: выбор параметров, управление пользователями, мониторинг подключений
+# Полный скрипт установки OpenVPN с российской криптографией ГОСТ
+# Включает все функции: установку, управление пользователями, мониторинг
 
+# Проверка root-прав
 if [ "$(id -u)" -ne 0 ]; then
   echo "Этот скрипт должен запускаться с правами root" >&2
   exit 1
@@ -11,8 +12,9 @@ fi
 # Конфигурационные переменные
 CONFIG_DIR="/etc/openvpn"
 SERVER_CONF="$CONFIG_DIR/server-gost.conf"
-CA_DIR="/root/openvpn-ca"
-KEYS_DIR="$CA_DIR/keys"
+EASY_RSA_DIR="/etc/openvpn/easy-rsa"
+CA_DIR="$EASY_RSA_DIR"
+KEYS_DIR="$CA_DIR/pki"
 MANAGEMENT_SOCKET="/tmp/openvpn-mgmt.sock"
 MANAGEMENT_PORT=5555
 LOG_FILE="/var/log/openvpn-gost.log"
@@ -33,12 +35,14 @@ vpn_service() {
 # Функция создания пользователя
 create_user() {
   cd $CA_DIR
-  source vars
   echo "Создание пользователя $1"
-  ./build-key "$1"
   
-  # Генерация клиентского конфига
-  cat > $KEYS_DIR/"$1".ovpn <<EOF
+  # Генерация ключей и сертификатов через easyrsa
+  ./easyrsa gen-req $1 nopass
+  ./easyrsa sign-req client $1
+  
+  # Создание клиентского конфига
+  cat > $KEYS_DIR/issued/"$1".ovpn <<EOF
 client
 dev tun
 proto $PROTO
@@ -55,10 +59,10 @@ verb 3
 $(cat $KEYS_DIR/ca.crt)
 </ca>
 <cert>
-$(sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' $KEYS_DIR/"$1".crt)
+$(sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' $KEYS_DIR/issued/"$1".crt)
 </cert>
 <key>
-$(cat $KEYS_DIR/"$1".key)
+$(cat $KEYS_DIR/private/"$1".key)
 </key>
 <tls-auth>
 $(cat $KEYS_DIR/ta.key)
@@ -66,19 +70,19 @@ $(cat $KEYS_DIR/ta.key)
 key-direction 1
 EOF
   
-  echo "Конфиг для $1 создан: $KEYS_DIR/$1.ovpn"
+  echo "Конфиг для $1 создан: $KEYS_DIR/issued/$1.ovpn"
 }
 
 # Функция отображения статистики
 show_stats() {
   echo "Текущие подключения:"
-  echo "status /var/log/openvpn/openvpn-status.log" | nc -U $MANAGEMENT_SOCKET | grep "^CLIENT_LIST"
+  echo "status 3" | nc -U $MANAGEMENT_SOCKET | grep "^CLIENT_LIST"
   
   echo -e "\nОбщая статистика:"
   echo "load-stats" | nc -U $MANAGEMENT_SOCKET
   
   echo -e "\nТрафик:"
-  echo "bytecount" | nc -U $MANAGEMENT_SOCKET
+  echo "bytecount 5" | nc -U $MANAGEMENT_SOCKET
 }
 
 # Функция отключения клиента
@@ -91,8 +95,11 @@ disconnect_client() {
 ban_client() {
   echo "Блокируем клиента $1"
   echo "kill $1" | nc -U $MANAGEMENT_SOCKET
-  sed -i "/^$1,/d" /var/log/openvpn/openvpn-status.log
-  echo "disabled" > $KEYS_DIR/$1/revoked
+  ./easyrsa revoke $1
+  ./easyrsa gen-crl
+  cp pki/crl.pem $CONFIG_DIR/
+  echo "crl-verify $CONFIG_DIR/crl.pem" >> $SERVER_CONF
+  systemctl restart openvpn-server@server-gost
 }
 
 # Установка OpenVPN с GOST
@@ -123,7 +130,12 @@ install_openvpn_gost() {
 
   # Установка пакетов
   apt-get update
-  apt-get install -y openvpn easy-rsa openssl gost-engine netcat
+  apt-get install -y openvpn easy-rsa openssl gost-engine netcat-traditional ufw
+
+  # Настройка EasyRSA
+  make-cadir $EASY_RSA_DIR
+  cd $EASY_RSA_DIR
+  ./easyrsa init-pki
 
   # Настройка GOST engine
   cat > /etc/ssl/openssl.cnf <<EOF
@@ -141,32 +153,25 @@ EOF
 
   export OPENSSL_CONF=/etc/ssl/openssl.cnf
 
-  # Настройка PKI
-  make-cadir $CA_DIR
-  cd $CA_DIR
-  source vars
+  # Генерация сертификатов
+  ./easyrsa build-ca nopass
+  ./easyrsa gen-req server nopass
+  ./easyrsa sign-req server server
+  ./easyrsa gen-dh
+  openvpn --genkey --secret $KEYS_DIR/ta.key
 
-  sed -i 's/KEY_ALGO=.*/KEY_ALGO=GOST2001/' vars
-  sed -i 's/KEY_NAME=.*/KEY_NAME="server-gost"/' vars
-  sed -i 's/KEY_OU=.*/KEY_OU="OpenVPN-GOST"/' vars
-
-  ./clean-all
-  ./build-ca --interactive
-  ./build-key-server server
-  ./build-dh
-  openvpn --genkey --secret ta.key
-
-  # Конфигурация сервера с management-интерфейсом
+  # Конфигурация сервера
   cat > $SERVER_CONF <<EOF
 port $PORT
 proto $PROTO
 dev tun
 ca $KEYS_DIR/ca.crt
-cert $KEYS_DIR/server.crt
-key $KEYS_DIR/server.key
-dh $KEYS_DIR/dh2048.pem
+cert $KEYS_DIR/issued/server.crt
+key $KEYS_DIR/private/server.key
+dh $KEYS_DIR/dh.pem
 tls-auth $KEYS_DIR/ta.key 0
 server 10.8.0.0 255.255.255.0
+push "redirect-gateway def1 bypass-dhcp"
 push "dhcp-option DNS $DNS"
 ifconfig-pool-persist /var/log/openvpn/ipp.txt
 keepalive 10 120
@@ -188,7 +193,6 @@ EOF
   sysctl -p
 
   # Настройка фаервола
-  apt-get install -y ufw
   ufw allow $PORT/$PROTO
   ufw allow OpenSSH
   ufw --force enable
