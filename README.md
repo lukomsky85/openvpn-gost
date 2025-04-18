@@ -26,7 +26,7 @@
 ## Установка
 
 ```bash
-wget https://raw.githubusercontent.com/ваш_пользователь/openvpn-gost/main/install.sh
+wget https://raw.githubusercontent.com/lukomsky85/openvpn-gost/main/install.sh
 chmod +x install.sh
 sudo ./install.sh
 ```
